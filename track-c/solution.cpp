@@ -1,3 +1,4 @@
+// candidate_c03.cpp - Track C High-Throughput Parallel Ingest with Compact Memory Architecture
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -12,12 +13,13 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <thread>
 #include <chrono>
+#include <atomic>
 
 namespace fs = std::filesystem;
 using clock_type = std::chrono::high_resolution_clock;
 
-// Format cents: -525 -> "-5.25", -5 -> "-0.05", 0 -> "0.00"
 inline std::string format_cents(int64_t cents) {
     std::string s;
     if (cents < 0) {
@@ -32,95 +34,105 @@ inline std::string format_cents(int64_t cents) {
     return s;
 }
 
-// Fast string hashing (Murmur/FNV style)
-inline uint64_t hash_str(const char* data, size_t len) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<unsigned char>(data[i]);
+inline uint64_t hash_bytes(const char* data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL ^ (len * 0x517cc1b727220a95ULL);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    while (len >= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        h ^= v;
         h *= 0x100000001b3ULL;
+        p += 8;
+        len -= 8;
+    }
+    if (len >= 4) {
+        uint32_t v;
+        std::memcpy(&v, p, 4);
+        h ^= v;
+        h *= 0x100000001b3ULL;
+        p += 4;
+        len -= 4;
+    }
+    while (len > 0) {
+        h ^= *p++;
+        h *= 0x100000001b3ULL;
+        --len;
     }
     return h;
 }
 
-// Global String Interner
-// Memory arena for deduplicated strings
-struct StringInterner {
-    struct Slot {
-        uint32_t offset;
-        uint16_t len;
-        bool occupied;
-        uint8_t pad;
-        uint64_t hash;
+// Global thread-safe open-addressing interner for deduplicating distinct names
+// Fixed capacity 262,144 slots (sufficient for 100,000 distinct names at ~38% load factor)
+struct ConcurrentStringInterner {
+    static constexpr size_t TABLE_SIZE = 262144;
+    static constexpr uint32_t MASK = TABLE_SIZE - 1;
+
+    struct alignas(16) Slot {
+        std::atomic<uint64_t> hash{0};
+        uint32_t offset{0};
+        uint32_t id{0};
+        uint16_t len{0};
+        std::atomic<uint8_t> state{0}; // 0 = empty, 1 = initializing, 2 = ready
     };
 
-    std::vector<char> pool;
-    std::vector<Slot> slots; // hash table with open addressing
-    uint32_t mask;
-    uint32_t count = 0;
-
-    StringInterner(size_t cap = 262144) {
-        pool.reserve(4 * 1024 * 1024); // 4 MB pool
-        // Cap is power of 2
-        slots.resize(cap, {0, 0, false, 0, 0});
-        mask = static_cast<uint32_t>(cap - 1);
-    }
-
-    void grow() {
-        size_t new_cap = slots.size() * 2;
-        std::vector<Slot> new_slots(new_cap, {0, 0, false, 0, 0});
-        uint32_t new_mask = static_cast<uint32_t>(new_cap - 1);
-        for (const auto& slot : slots) {
-            if (slot.occupied) {
-                uint32_t idx = static_cast<uint32_t>(slot.hash) & new_mask;
-                while (new_slots[idx].occupied) {
-                    idx = (idx + 1) & new_mask;
-                }
-                new_slots[idx] = slot;
-            }
-        }
-        slots = std::move(new_slots);
-        mask = new_mask;
-    }
+    Slot slots[TABLE_SIZE];
+    char pool[4 * 1024 * 1024]; // 4 MB fixed arena
+    std::atomic<uint32_t> pool_bump{0};
+    std::atomic<uint32_t> next_id{0};
 
     uint32_t intern(const char* s, size_t len, uint64_t h) {
-        uint32_t idx = static_cast<uint32_t>(h) & mask;
-        while (slots[idx].occupied) {
-            if (slots[idx].len == len && slots[idx].hash == h &&
-                (len == 0 || std::memcmp(pool.data() + slots[idx].offset, s, len) == 0)) {
-                return idx; // Found existing
-            }
-            idx = (idx + 1) & mask;
-        }
+        if (h == 0) h = 1;
+        uint32_t idx = static_cast<uint32_t>(h) & MASK;
 
-        // Insert new string into pool
-        uint32_t offset = static_cast<uint32_t>(pool.size());
-        if (len > 0) {
-            pool.insert(pool.end(), s, s + len);
-        }
-
-        slots[idx] = {offset, static_cast<uint16_t>(len), true, 0, h};
-        count++;
-
-        if (count * 10 >= slots.size() * 7) {
-            grow();
-            // Look up the slot again in the resized table to return its new index
-            idx = static_cast<uint32_t>(h) & mask;
-            while (slots[idx].occupied) {
-                if (slots[idx].len == len && slots[idx].hash == h &&
-                    (len == 0 || std::memcmp(pool.data() + slots[idx].offset, s, len) == 0)) {
-                    return idx;
+        while (true) {
+            uint8_t st = slots[idx].state.load(std::memory_order_acquire);
+            if (st == 2) {
+                if (slots[idx].hash.load(std::memory_order_relaxed) == h && slots[idx].len == len) {
+                    if (len == 0 || std::memcmp(pool + slots[idx].offset, s, len) == 0) {
+                        return slots[idx].id;
+                    }
                 }
-                idx = (idx + 1) & mask;
+            } else if (st == 1) {
+                // Another thread is actively initializing this slot.
+                // We MUST wait for it to become ready (state == 2) rather than skipping it,
+                // otherwise we could skip past the very slot where our string is being inserted!
+                while ((st = slots[idx].state.load(std::memory_order_acquire)) == 1) {
+                    #if defined(__x86_64__) || defined(_M_X64)
+                    __builtin_ia32_pause();
+                    #endif
+                }
+                if (st == 2) {
+                    if (slots[idx].hash.load(std::memory_order_relaxed) == h && slots[idx].len == len) {
+                        if (len == 0 || std::memcmp(pool + slots[idx].offset, s, len) == 0) {
+                            return slots[idx].id;
+                        }
+                    }
+                }
+            } else if (st == 0) {
+                uint8_t expected = 0;
+                if (slots[idx].state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                    // Claimed! Fill data
+                    uint32_t off = pool_bump.fetch_add(static_cast<uint32_t>(len), std::memory_order_relaxed);
+                    if (len > 0) {
+                        std::memcpy(pool + off, s, len);
+                    }
+                    slots[idx].offset = off;
+                    slots[idx].len = static_cast<uint16_t>(len);
+                    slots[idx].id = next_id.fetch_add(1, std::memory_order_relaxed);
+                    slots[idx].hash.store(h, std::memory_order_relaxed);
+                    slots[idx].state.store(2, std::memory_order_release);
+                    return slots[idx].id;
+                }
+                continue;
             }
+            idx = (idx + 1) & MASK;
         }
-
-        return idx;
     }
 };
 
-// Compact flat hash set for interned string IDs per country
+// Compact flat hash set for interned integer IDs per country
 struct FlatIdSet {
-    std::vector<uint32_t> table; // stores intern_id + 1 (0 is empty)
+    std::vector<uint32_t> table;
     uint32_t mask;
     uint32_t size_count = 0;
 
@@ -129,7 +141,7 @@ struct FlatIdSet {
         mask = static_cast<uint32_t>(initial_cap - 1);
     }
 
-    void insert(uint32_t id) {
+    inline void insert(uint32_t id) {
         uint32_t val = id + 1;
         uint32_t idx = (id * 2654435761U) & mask;
         while (table[idx] != 0) {
@@ -161,12 +173,9 @@ struct FlatIdSet {
         mask = new_mask;
     }
 
-    size_t size() const {
-        return size_count;
-    }
+    inline size_t size() const { return size_count; }
 };
 
-// Country running aggregates
 struct CountryAgg {
     std::string name;
     uint64_t count = 0;
@@ -189,40 +198,187 @@ struct CountryAgg {
         note_bytes += unescaped_note_len;
         distinct_name_ids.insert(name_id);
     }
+
+    void merge(const CountryAgg& other) {
+        if (!other.active) return;
+        active = true;
+        count += other.count;
+        id_sum += other.id_sum;
+        amount_sum += other.amount_sum;
+        if (other.amount_min < amount_min) amount_min = other.amount_min;
+        if (other.amount_max > amount_max) amount_max = other.amount_max;
+        name_bytes += other.name_bytes;
+        note_bytes += other.note_bytes;
+        for (uint32_t val : other.distinct_name_ids.table) {
+            if (val != 0) {
+                distinct_name_ids.insert(val - 1);
+            }
+        }
+    }
 };
 
-// Fast integer parsing
-inline uint64_t parse_uint(const char* p, const char* end) {
-    uint64_t val = 0;
-    for (; p < end; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            val = val * 10 + (*p - '0');
-        }
-    }
-    return val;
-}
+static constexpr size_t MAX_REGIONS = 1000000;
+static constexpr uint16_t UNMATCHED_ID = 0xFFFF;
 
-// Fast decimal cents parsing: (-?)([0-9]+)\.([0-9]{2})
-inline int64_t parse_cents(const char* p, const char* end) {
-    bool neg = false;
-    if (p < end && *p == '-') {
-        neg = true;
-        ++p;
+struct WorkerData {
+    std::vector<CountryAgg> local_countries;
+    double process_ms = 0;
+};
+
+void process_chunk(const char* chunk_start, const char* chunk_end,
+                   const uint16_t* region_to_country, uint16_t unmatched_country_id,
+                   const std::vector<std::string>& country_names,
+                   ConcurrentStringInterner* interner,
+                   WorkerData* worker) {
+    auto t0 = clock_type::now();
+    worker->local_countries.resize(country_names.size());
+    for (size_t i = 0; i < country_names.size(); ++i) {
+        worker->local_countries[i].name = country_names[i];
+        worker->local_countries[i].distinct_name_ids = FlatIdSet(256);
     }
-    int64_t whole = 0;
-    for (; p < end && *p != '.'; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            whole = whole * 10 + (*p - '0');
+
+    const char* ptr = chunk_start;
+    const char* end = chunk_end;
+
+    char stack_unescape[256];
+
+    while (ptr < end) {
+        // Strip BOM
+        if (end - ptr >= 3 && static_cast<unsigned char>(ptr[0]) == 0xEF &&
+            static_cast<unsigned char>(ptr[1]) == 0xBB && static_cast<unsigned char>(ptr[2]) == 0xBF) {
+            ptr += 3;
         }
+        if (ptr >= end || *ptr == '\r' || *ptr == '\n') {
+            while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ptr++;
+            continue;
+        }
+
+        // 1. Fast ID parse
+        uint64_t record_id = 0;
+        while (ptr < end && static_cast<unsigned char>(*ptr - '0') <= 9) {
+            record_id = record_id * 10 + (*ptr++ - '0');
+        }
+        if (ptr < end && *ptr == ',') ptr++;
+
+        // 2. Name parse with in-situ / stack unescaping
+        const char* unescaped_name_ptr = "";
+        size_t unescaped_name_len = 0;
+        uint64_t nh = 0;
+
+        if (ptr < end && *ptr == '"') {
+            ptr++;
+            const char* p_name_start = ptr;
+            uint32_t name_escaped_quotes = 0;
+
+            while (ptr < end) {
+                if (*ptr == '"') {
+                    if (ptr + 1 < end && *(ptr + 1) == '"') {
+                        name_escaped_quotes++;
+                        ptr += 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    ptr++;
+                }
+            }
+            const char* p_name_end = ptr;
+            if (ptr < end && *ptr == '"') ptr++;
+            if (ptr < end && *ptr == ',') ptr++;
+
+            size_t raw_name_len = p_name_end - p_name_start;
+            unescaped_name_len = raw_name_len - name_escaped_quotes;
+
+            if (name_escaped_quotes == 0) {
+                unescaped_name_ptr = p_name_start;
+            } else {
+                size_t w = 0;
+                for (size_t r = 0; r < raw_name_len; ++r) {
+                    if (p_name_start[r] == '"' && r + 1 < raw_name_len && p_name_start[r + 1] == '"') {
+                        stack_unescape[w++] = '"';
+                        ++r;
+                    } else {
+                        stack_unescape[w++] = p_name_start[r];
+                    }
+                }
+                unescaped_name_ptr = stack_unescape;
+            }
+            nh = hash_bytes(unescaped_name_ptr, unescaped_name_len);
+        } else {
+            while (ptr < end && *ptr != ',') ptr++;
+            if (ptr < end && *ptr == ',') ptr++;
+            unescaped_name_ptr = "";
+            unescaped_name_len = 0;
+            nh = 0xcbf29ce484222325ULL;
+        }
+
+        uint32_t name_id = interner->intern(unescaped_name_ptr, unescaped_name_len, nh);
+
+        // 3. Note parse (unescaped length only)
+        size_t unescaped_note_len = 0;
+        if (ptr < end && *ptr == '"') {
+            ptr++;
+            const char* p_note_start = ptr;
+            uint32_t note_escaped_quotes = 0;
+            while (ptr < end) {
+                if (*ptr == '"') {
+                    if (ptr + 1 < end && *(ptr + 1) == '"') {
+                        note_escaped_quotes++;
+                        ptr += 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    ptr++;
+                }
+            }
+            const char* p_note_end = ptr;
+            if (ptr < end && *ptr == '"') ptr++;
+            if (ptr < end && *ptr == ',') ptr++;
+            unescaped_note_len = (p_note_end - p_note_start) - note_escaped_quotes;
+        } else {
+            while (ptr < end && *ptr != ',') ptr++;
+            if (ptr < end && *ptr == ',') ptr++;
+            unescaped_note_len = 0;
+        }
+
+        // 4. Region ID parse (fast integer accumulator)
+        uint64_t region_id = 0;
+        while (ptr < end && static_cast<unsigned char>(*ptr - '0') <= 9) {
+            region_id = region_id * 10 + (*ptr++ - '0');
+        }
+        if (ptr < end && *ptr == ',') ptr++;
+
+        // 5. Amount parse: [-]WHOLE.FRAC
+        bool neg = false;
+        if (ptr < end && *ptr == '-') {
+            neg = true;
+            ptr++;
+        }
+        int64_t whole = 0;
+        while (ptr < end && static_cast<unsigned char>(*ptr - '0') <= 9) {
+            whole = whole * 10 + (*ptr++ - '0');
+        }
+        int64_t frac = 0;
+        if (ptr < end && *ptr == '.') {
+            ptr++;
+            if (ptr < end && static_cast<unsigned char>(*ptr - '0') <= 9) frac += (*ptr++ - '0') * 10;
+            if (ptr < end && static_cast<unsigned char>(*ptr - '0') <= 9) frac += (*ptr++ - '0');
+        }
+        int64_t cents = whole * 100 + frac;
+        if (neg) cents = -cents;
+
+        while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ptr++;
+
+        // 6. Direct lookup join & aggregate
+        uint16_t cid = (region_id < MAX_REGIONS) ? region_to_country[region_id] : UNMATCHED_ID;
+        if (cid == UNMATCHED_ID) cid = unmatched_country_id;
+
+        CountryAgg& c = worker->local_countries[cid];
+        c.active = true;
+        c.add(record_id, name_id, unescaped_name_len, unescaped_note_len, cents);
     }
-    int64_t frac = 0;
-    if (p < end && *p == '.') {
-        ++p;
-        if (p < end) frac += (*p++ - '0') * 10;
-        if (p < end) frac += (*p++ - '0');
-    }
-    int64_t total = whole * 100 + frac;
-    return neg ? -total : total;
+    worker->process_ms = std::chrono::duration<double, std::milli>(clock_type::now() - t0).count();
 }
 
 int main(int argc, char* argv[]) {
@@ -237,53 +393,66 @@ int main(int argc, char* argv[]) {
     if (argc >= 2) data_dir = argv[1];
     if (argc >= 3) out_dir = argv[2];
 
+    unsigned int num_workers = std::thread::hardware_concurrency();
+    if (argc >= 4) {
+        try {
+            int parsed = std::stoi(argv[3]);
+            num_workers = std::max(1, std::min(64, parsed));
+        } catch (...) {
+            num_workers = num_workers > 0 ? num_workers : 8;
+        }
+    } else {
+        num_workers = num_workers > 0 ? num_workers : 8;
+    }
+
     fs::path regions_path = fs::path(data_dir) / "regions.csv";
     fs::path records_path = fs::path(data_dir) / "records.csv";
     fs::path output_path = fs::path(out_dir) / "aggregates.txt";
 
-    // 1. Load regions.csv into flat direct-lookup table
-    static constexpr size_t MAX_REGIONS = 1000000;
-    static constexpr uint16_t UNMATCHED_ID = 0xFFFF;
     std::vector<uint16_t> region_to_country(MAX_REGIONS, UNMATCHED_ID);
-
-    std::vector<CountryAgg> countries;
-    countries.reserve(256);
+    std::vector<std::string> country_names;
+    country_names.reserve(256);
 
     auto get_country_id = [&](std::string_view cname) -> uint16_t {
-        for (uint16_t i = 0; i < countries.size(); ++i) {
-            if (countries[i].name == cname) return i;
+        for (uint16_t i = 0; i < country_names.size(); ++i) {
+            if (country_names[i] == cname) return i;
         }
-        uint16_t new_id = static_cast<uint16_t>(countries.size());
-        countries.emplace_back();
-        countries.back().name = std::string(cname);
+        uint16_t new_id = static_cast<uint16_t>(country_names.size());
+        country_names.emplace_back(cname);
         return new_id;
     };
 
     uint16_t unmatched_country_id = get_country_id("_UNMATCHED");
 
-    {
-        std::ifstream rf(regions_path);
-        if (!rf.is_open()) return 1;
-        std::string line;
-        // Skip header
-        if (std::getline(rf, line)) {
-            while (std::getline(rf, line)) {
-                if (line.empty() || line[0] == '\r') continue;
-                size_t comma = line.find(',');
-                if (comma == std::string::npos) continue;
-                uint64_t rid = parse_uint(line.data(), line.data() + comma);
-                size_t end_c = line.find_first_of("\r\n", comma + 1);
-                if (end_c == std::string::npos) end_c = line.size();
-                std::string_view cname(line.data() + comma + 1, end_c - (comma + 1));
+    // Fast regions.csv mmap parse
+    int rfd = open(regions_path.c_str(), O_RDONLY);
+    if (rfd >= 0) {
+        struct stat rsb;
+        if (fstat(rfd, &rsb) == 0 && rsb.st_size > 0) {
+            const char* rdata = static_cast<const char*>(mmap(nullptr, rsb.st_size, PROT_READ, MAP_PRIVATE, rfd, 0));
+            const char* rp = rdata;
+            const char* rend = rdata + rsb.st_size;
+            while (rp < rend && *rp != '\n') rp++;
+            if (rp < rend && *rp == '\n') rp++;
+            while (rp < rend) {
+                if (*rp == '\r' || *rp == '\n') { rp++; continue; }
+                uint64_t rid = 0;
+                while (rp < rend && *rp >= '0' && *rp <= '9') rid = rid * 10 + (*rp++ - '0');
+                if (rp < rend && *rp == ',') rp++;
+                const char* cp_start = rp;
+                while (rp < rend && *rp != '\r' && *rp != '\n') rp++;
+                std::string_view cname(cp_start, rp - cp_start);
                 uint16_t cid = get_country_id(cname);
                 if (rid < MAX_REGIONS) {
                     region_to_country[rid] = cid;
                 }
+                while (rp < rend && (*rp == '\r' || *rp == '\n')) rp++;
             }
+            munmap(const_cast<char*>(rdata), rsb.st_size);
         }
+        close(rfd);
     }
 
-    // 2. Mmap records.csv
     int fd = open(records_path.c_str(), O_RDONLY);
     if (fd < 0) return 1;
 
@@ -301,146 +470,87 @@ int main(int argc, char* argv[]) {
     const char* data = static_cast<const char*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
     madvise(const_cast<char*>(data), file_size, MADV_SEQUENTIAL);
 
-    const char* ptr = data;
-    const char* end = data + file_size;
+    const char* file_start = data;
+    const char* file_end = data + file_size;
 
-    // Check BOM at start of file (\xEF\xBB\xBF)
-    if (end - ptr >= 3 && static_cast<unsigned char>(ptr[0]) == 0xEF &&
-        static_cast<unsigned char>(ptr[1]) == 0xBB && static_cast<unsigned char>(ptr[2]) == 0xBF) {
-        ptr += 3;
+    if (file_end - file_start >= 3 && static_cast<unsigned char>(file_start[0]) == 0xEF &&
+        static_cast<unsigned char>(file_start[1]) == 0xBB && static_cast<unsigned char>(file_start[2]) == 0xBF) {
+        file_start += 3;
     }
 
-    // Skip CSV header line: id,name,note,region_id,amount\n
-    while (ptr < end && *ptr != '\n') ptr++;
-    if (ptr < end && *ptr == '\n') ptr++;
+    while (file_start < file_end && *file_start != '\n') file_start++;
+    if (file_start < file_end && *file_start == '\n') file_start++;
 
-    StringInterner interner;
-    std::string unescape_scratch;
-    unescape_scratch.reserve(1024);
+    std::vector<const char*> chunk_starts(num_workers + 1);
+    chunk_starts[0] = file_start;
+    chunk_starts[num_workers] = file_end;
 
-    // 3. RFC-Compliant Streaming CSV Parser
-    while (ptr < end) {
-        // Strip BOM if present right after a newline
-        if (end - ptr >= 3 && static_cast<unsigned char>(ptr[0]) == 0xEF &&
-            static_cast<unsigned char>(ptr[1]) == 0xBB && static_cast<unsigned char>(ptr[2]) == 0xBF) {
-            ptr += 3;
-        }
-        if (ptr >= end || *ptr == '\r' || *ptr == '\n') {
-            while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ptr++;
-            continue;
-        }
+    size_t content_size = file_end - file_start;
+    size_t target_chunk_size = content_size / num_workers;
 
-        // Field 0: id (unquoted integer)
-        const char* p_id_start = ptr;
-        while (ptr < end && *ptr != ',') ptr++;
-        uint64_t record_id = parse_uint(p_id_start, ptr);
-        if (ptr < end && *ptr == ',') ptr++;
+    for (unsigned int i = 1; i < num_workers; ++i) {
+        const char* target = file_start + i * target_chunk_size;
+        const char* cand = target;
+        while (cand < file_end && *cand != '\n') cand++;
+        if (cand < file_end) cand++;
 
-        // Field 1: name (may be quoted, can have escaped quotes "")
-        const char* p_name_start = ptr;
-        const char* p_name_end = ptr;
-        uint32_t name_escaped_quotes = 0;
-        if (ptr < end && *ptr == '"') {
-            ptr++;
-            p_name_start = ptr;
-            while (ptr < end) {
-                if (*ptr == '"') {
-                    if (ptr + 1 < end && *(ptr + 1) == '"') {
-                        name_escaped_quotes++;
-                        ptr += 2;
-                    } else {
-                        p_name_end = ptr;
-                        ptr++; // consume closing quote
-                        break;
-                    }
-                } else {
-                    ptr++;
+        while (cand < file_end) {
+            const char* cp = cand;
+            if (file_end - cp >= 3 && static_cast<unsigned char>(cp[0]) == 0xEF &&
+                static_cast<unsigned char>(cp[1]) == 0xBB && static_cast<unsigned char>(cp[2]) == 0xBF) {
+                cp += 3;
+            }
+            bool has_id = false;
+            while (cp < file_end && *cp >= '0' && *cp <= '9') {
+                has_id = true;
+                cp++;
+            }
+            if (has_id && cp < file_end && *cp == ',') {
+                cp++;
+                if (cp < file_end && (*cp == ',' || *cp == '"')) {
+                    break;
                 }
             }
-            if (ptr < end && *ptr == ',') ptr++;
-        } else {
-            while (ptr < end && *ptr != ',') ptr++;
-            p_name_end = ptr;
-            if (ptr < end && *ptr == ',') ptr++;
+            while (cand < file_end && *cand != '\n') cand++;
+            if (cand < file_end) cand++;
         }
-        size_t raw_name_len = p_name_end - p_name_start;
-        size_t unescaped_name_len = raw_name_len - name_escaped_quotes;
+        chunk_starts[i] = cand;
+    }
 
-        const char* unescaped_name_ptr = p_name_start;
-        if (name_escaped_quotes > 0) {
-            unescape_scratch.clear();
-            unescape_scratch.reserve(unescaped_name_len);
-            for (size_t i = 0; i < raw_name_len; ++i) {
-                if (p_name_start[i] == '"' && i + 1 < raw_name_len && p_name_start[i + 1] == '"') {
-                    unescape_scratch += '"';
-                    ++i;
-                } else {
-                    unescape_scratch += p_name_start[i];
-                }
-            }
-            unescaped_name_ptr = unescape_scratch.data();
+    // Single shared concurrent interner
+    static ConcurrentStringInterner global_interner;
+
+    std::vector<std::thread> workers;
+    std::vector<WorkerData> worker_data(num_workers);
+
+    for (unsigned int i = 0; i < num_workers; ++i) {
+        if (chunk_starts[i] < chunk_starts[i + 1]) {
+            workers.emplace_back(process_chunk, chunk_starts[i], chunk_starts[i + 1],
+                                 region_to_country.data(), unmatched_country_id,
+                                 std::cref(country_names), &global_interner, &worker_data[i]);
         }
+    }
 
-        uint64_t nh = hash_str(unescaped_name_ptr, unescaped_name_len);
-        uint32_t name_id = interner.intern(unescaped_name_ptr, unescaped_name_len, nh);
-
-        // Field 2: note (may be quoted, can have escaped quotes and embedded newlines)
-        const char* p_note_start = ptr;
-        const char* p_note_end = ptr;
-        uint32_t note_escaped_quotes = 0;
-        if (ptr < end && *ptr == '"') {
-            ptr++;
-            p_note_start = ptr;
-            while (ptr < end) {
-                if (*ptr == '"') {
-                    if (ptr + 1 < end && *(ptr + 1) == '"') {
-                        note_escaped_quotes++;
-                        ptr += 2;
-                    } else {
-                        p_note_end = ptr;
-                        ptr++; // consume closing quote
-                        break;
-                    }
-                } else {
-                    ptr++;
-                }
-            }
-            if (ptr < end && *ptr == ',') ptr++;
-        } else {
-            while (ptr < end && *ptr != ',') ptr++;
-            p_note_end = ptr;
-            if (ptr < end && *ptr == ',') ptr++;
-        }
-        size_t raw_note_len = p_note_end - p_note_start;
-        size_t unescaped_note_len = raw_note_len - note_escaped_quotes;
-
-        // Field 3: region_id (unquoted integer)
-        const char* p_reg_start = ptr;
-        while (ptr < end && *ptr != ',') ptr++;
-        uint64_t region_id = parse_uint(p_reg_start, ptr);
-        if (ptr < end && *ptr == ',') ptr++;
-
-        // Field 4: amount (signed decimal)
-        const char* p_amt_start = ptr;
-        while (ptr < end && *ptr != '\n' && *ptr != '\r') ptr++;
-        int64_t cents = parse_cents(p_amt_start, ptr);
-        while (ptr < end && (*ptr == '\r' || *ptr == '\n')) ptr++;
-
-        // Join
-        uint16_t cid = (region_id < MAX_REGIONS) ? region_to_country[region_id] : UNMATCHED_ID;
-        if (cid == UNMATCHED_ID) cid = unmatched_country_id;
-
-        CountryAgg& c = countries[cid];
-        c.active = true;
-        c.add(record_id, name_id, unescaped_name_len, unescaped_note_len, cents);
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
     }
 
     munmap(const_cast<char*>(data), file_size);
     close(fd);
 
-    // 4. Sort countries lexicographically
+    std::vector<CountryAgg> global_countries(country_names.size());
+    for (size_t i = 0; i < country_names.size(); ++i) {
+        global_countries[i].name = country_names[i];
+    }
+
+    for (const auto& wdata : worker_data) {
+        for (size_t c = 0; c < wdata.local_countries.size(); ++c) {
+            global_countries[c].merge(wdata.local_countries[c]);
+        }
+    }
+
     std::vector<CountryAgg*> active_countries;
-    for (CountryAgg& c : countries) {
+    for (CountryAgg& c : global_countries) {
         if (c.active) {
             active_countries.push_back(&c);
         }
@@ -450,7 +560,6 @@ int main(int argc, char* argv[]) {
         return a->name < b->name;
     });
 
-    // 5. Output serialization
     fs::create_directories(output_path.parent_path());
     std::ofstream out(output_path, std::ios::binary);
     if (!out.is_open()) return 1;
@@ -483,15 +592,16 @@ int main(int argc, char* argv[]) {
     out.flush();
 
     auto t_end = clock_type::now();
-    double exec_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
 
-    std::cerr << "TRACK_C_EXPERIMENT_RESULT: exec_ms=" << exec_ms
+    std::cerr << "C03 EXECUTION RESULT:"
+              << " total_ms=" << total_ms
               << " peak_rss_kb=" << usage.ru_maxrss
-              << " active_countries=" << active_countries.size()
-              << " distinct_names=" << interner.count
+              << " workers=" << num_workers
+              << " distinct_names=" << global_interner.next_id.load()
               << "\n";
 
     return 0;
