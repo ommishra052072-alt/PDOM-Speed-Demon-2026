@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | | | | | |
+| 1 | C++ query-vocabulary sorted postings, parallel query evaluation | run-4be04a6ca080 | 4.018 | 168.1 | 35.003 |

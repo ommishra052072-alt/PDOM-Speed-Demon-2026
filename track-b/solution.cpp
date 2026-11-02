@@ -177,27 +177,46 @@ int main(int argc, char **argv) try {
         const std::string &w = terms[id].word; size_t k = (size_t)hash_word(w.data(), w.size()) & (cap - 1);
         while (slots[k]) k = (k + 1) & (cap - 1); slots[k] = (int32_t)id + 1;
     }
-    std::vector<uint32_t> last(terms.size(), UINT32_MAX); std::vector<Span> docs; docs.reserve(250000);
-    Corpus corpus(data_dir + "/docs.txt"); size_t pos = 0; uint32_t doc = 0;
+    std::vector<Span> docs; docs.reserve(250000);
+    Corpus corpus(data_dir + "/docs.txt"); size_t pos = 0;
     while (pos < corpus.size) {
         size_t end = pos; while (end < corpus.size && corpus.data[end] != '\n') ++end;
         size_t tab = pos; while (tab < end && corpus.data[tab] != '\t') ++tab;
         if (tab == end) throw std::runtime_error("bad document line");
         docs.push_back({corpus.data + tab + 1, (uint32_t)(end - tab - 1)});
-        size_t i = tab + 1;
-        while (i < end) {
-            while (i < end && !alnum((unsigned char)corpus.data[i])) ++i;
-            size_t a = i; uint64_t h = 1469598103934665603ULL;
-            while (i < end && alnum((unsigned char)corpus.data[i])) h = (h ^ lower_ascii((unsigned char)corpus.data[i++])) * 1099511628211ULL;
-            if (i == a) continue;
-            int id = lookup(corpus.data + a, i - a, h, slots, terms);
-            if (id >= 0 && last[id] != doc) { last[id] = doc; terms[id].docs.push_back(doc); }
-        }
-        ++doc; pos = end + (end < corpus.size);
+        pos = end + (end < corpus.size);
     }
 
     std::vector<std::string> answers(queries.size()); std::atomic<size_t> next{0};
     unsigned workers = std::thread::hardware_concurrency(); if (!workers) workers = 4; workers = std::min(workers, 12u);
+    {
+        std::vector<std::vector<std::vector<uint32_t>>> local; local.reserve(workers);
+        for (unsigned w = 0; w < workers; ++w) local.emplace_back(terms.size());
+        std::vector<std::thread> index_pool; index_pool.reserve(workers);
+        for (unsigned w = 0; w < workers; ++w) {
+            size_t first = docs.size() * w / workers, last_doc = docs.size() * (w + 1) / workers;
+            index_pool.emplace_back([&, w, first, last_doc] {
+                std::vector<uint32_t> last(terms.size(), UINT32_MAX);
+                for (size_t d = first; d < last_doc; ++d) {
+                    const Span &span = docs[d]; size_t i = 0;
+                    while (i < span.n) {
+                        while (i < span.n && !alnum((unsigned char)span.p[i])) ++i;
+                        size_t a = i; uint64_t h = 1469598103934665603ULL;
+                        while (i < span.n && alnum((unsigned char)span.p[i])) h = (h ^ lower_ascii((unsigned char)span.p[i++])) * 1099511628211ULL;
+                        if (i == a) continue;
+                        int id = lookup(span.p + a, i - a, h, slots, terms);
+                        if (id >= 0 && last[id] != d) { last[id] = (uint32_t)d; local[w][id].push_back((uint32_t)d); }
+                    }
+                }
+            });
+        }
+        for (auto &t : index_pool) t.join();
+        for (size_t id = 0; id < terms.size(); ++id) {
+            size_t total = 0; for (unsigned w = 0; w < workers; ++w) total += local[w][id].size();
+            auto &dest = terms[id].docs; dest.reserve(total);
+            for (unsigned w = 0; w < workers; ++w) dest.insert(dest.end(), local[w][id].begin(), local[w][id].end());
+        }
+    }
     auto work = [&]() {
         std::vector<uint32_t> cur;
         for (;;) {
