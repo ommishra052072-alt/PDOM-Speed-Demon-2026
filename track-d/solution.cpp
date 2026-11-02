@@ -147,6 +147,8 @@ int main(int argc, char* argv[]) {
     uint32_t m = static_cast<uint32_t>(parse_uint64(p_g, end_g));
 
     std::vector<uint32_t> head(n + 1, 0);
+    // Bitset: bit v set iff node v is the head of at least one edge line (any incoming edge, self-loops included).
+    std::vector<uint64_t> has_in((static_cast<size_t>(n) + 63) / 64, 0);
 
     struct RawEdge {
         uint32_t u;
@@ -162,6 +164,7 @@ int main(int argc, char* argv[]) {
         uint64_t w = parse_uint64(p_g, end_g);
         raw_edges[i] = {u, v, w};
         head[u]++;
+        has_in[v >> 6] |= (uint64_t(1) << (v & 63));
     }
 
     munmap(const_cast<char*>(g_data), g_size);
@@ -242,6 +245,12 @@ int main(int argc, char* argv[]) {
 
             if (s == t) {
                 answers[idx] = 0;
+                continue;
+            }
+
+            // No incoming edge at t and s != t: t is unreachable from s.
+            if (((has_in[t >> 6] >> (t & 63)) & 1) == 0) {
+                answers[idx] = -1;
                 continue;
             }
 
