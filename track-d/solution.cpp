@@ -1,4 +1,7 @@
 #include <iostream>
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <fstream>
 #include <vector>
 #include <queue>
@@ -32,7 +35,7 @@ inline uint64_t parse_uint64(const char*& p, const char* end) {
 
 struct Edge {
     uint32_t to;
-    uint64_t weight;
+    uint32_t weight;
 };
 
 struct DistNode {
@@ -40,76 +43,53 @@ struct DistNode {
     uint32_t u;
 };
 
-// 4-ary Min-Heap
-struct QuadHeap {
-    std::vector<DistNode> data;
+// Monotone 64-bit radix heap for Dijkstra's nondecreasing distance keys.
+struct RadixHeap {
+    std::array<std::vector<DistNode>, 65> buckets;
+    uint64_t last = 0;
+    size_t count = 0;
 
-    QuadHeap() {
-        data.reserve(16384);
+    static unsigned bucket_index(uint64_t key, uint64_t base) {
+        return static_cast<unsigned>(std::bit_width(key ^ base));
     }
 
     bool empty() const {
-        return data.empty();
+        return count == 0;
     }
 
     void clear() {
-        data.clear();
+        for (auto& bucket : buckets) bucket.clear();
+        last = 0;
+        count = 0;
     }
 
     void push(uint64_t dist, uint32_t u) {
-        size_t idx = data.size();
-        data.push_back({dist, u});
-        while (idx > 0) {
-            size_t parent = (idx - 1) / 4;
-            if (data[idx].dist < data[parent].dist) {
-                std::swap(data[idx], data[parent]);
-                idx = parent;
-            } else {
-                break;
-            }
-        }
+        buckets[bucket_index(dist, last)].push_back({dist, u});
+        ++count;
     }
 
     DistNode pop() {
-        DistNode min_item = data[0];
-        DistNode last = data.back();
-        data.pop_back();
-        if (!data.empty()) {
-            data[0] = last;
-            size_t idx = 0;
-            size_t sz = data.size();
-            while (true) {
-                size_t first_child = 4 * idx + 1;
-                if (first_child >= sz) break;
+        if (buckets[0].empty()) {
+            unsigned i = 1;
+            while (buckets[i].empty()) ++i;
 
-                size_t best_child = first_child;
-                uint64_t best_dist = data[first_child].dist;
+            uint64_t new_last = UINT64_MAX;
+            for (const DistNode& item : buckets[i]) {
+                new_last = std::min(new_last, item.dist);
+            }
+            last = new_last;
 
-                size_t c2 = first_child + 1;
-                if (c2 < sz && data[c2].dist < best_dist) {
-                    best_child = c2;
-                    best_dist = data[c2].dist;
-                }
-                size_t c3 = first_child + 2;
-                if (c3 < sz && data[c3].dist < best_dist) {
-                    best_child = c3;
-                    best_dist = data[c3].dist;
-                }
-                size_t c4 = first_child + 3;
-                if (c4 < sz && data[c4].dist < best_dist) {
-                    best_child = c4;
-                    best_dist = data[c4].dist;
-                }
-
-                if (best_dist < data[idx].dist) {
-                    std::swap(data[idx], data[best_child]);
-                    idx = best_child;
-                } else {
-                    break;
-                }
+            std::vector<DistNode> old_bucket;
+            old_bucket.swap(buckets[i]);
+            for (const DistNode& item : old_bucket) {
+                buckets[bucket_index(item.dist, last)].push_back(item);
             }
         }
-        return min_item;
+
+        DistNode result = buckets[0].back();
+        buckets[0].pop_back();
+        --count;
+        return result;
     }
 };
 
@@ -146,48 +126,99 @@ int main(int argc, char* argv[]) {
     uint32_t n = static_cast<uint32_t>(parse_uint64(p_g, end_g));
     uint32_t m = static_cast<uint32_t>(parse_uint64(p_g, end_g));
 
-    std::vector<uint32_t> head(n + 1, 0);
-    // Bitset: bit v set iff node v is the head of at least one edge line (any incoming edge, self-loops included).
-    std::vector<uint64_t> has_in((static_cast<size_t>(n) + 63) / 64, 0);
+    // Parallel two-pass CSR builder. Each worker owns one contiguous input chunk and
+    // one private degree row; its second-pass cursor row reserves disjoint CSR slots.
+    constexpr uint32_t build_workers = 8;
+    const size_t n_nodes = static_cast<size_t>(n);
+    const size_t n_words = (n_nodes + 63) / 64;
+    const char* graph_begin = p_g;
 
-    struct RawEdge {
-        uint32_t u;
-        uint32_t v;
-        uint64_t w;
-    };
-    std::vector<RawEdge> raw_edges;
-    raw_edges.resize(m);
-
-    for (uint32_t i = 0; i < m; ++i) {
-        uint32_t u = static_cast<uint32_t>(parse_uint64(p_g, end_g));
-        uint32_t v = static_cast<uint32_t>(parse_uint64(p_g, end_g));
-        uint64_t w = parse_uint64(p_g, end_g);
-        raw_edges[i] = {u, v, w};
-        head[u]++;
-        has_in[v >> 6] |= (uint64_t(1) << (v & 63));
+    std::vector<const char*> chunk_starts(build_workers + 1);
+    chunk_starts[0] = graph_begin;
+    chunk_starts[build_workers] = end_g;
+    for (uint32_t worker = 1; worker < build_workers; ++worker) {
+        const char* boundary = graph_begin +
+            (static_cast<size_t>(end_g - graph_begin) * worker / build_workers);
+        if (boundary > graph_begin && boundary[-1] != '\n') {
+            while (boundary < end_g && *boundary != '\n') ++boundary;
+            if (boundary < end_g) ++boundary;
+        }
+        chunk_starts[worker] = boundary;
     }
+
+    std::vector<uint32_t> local_degrees(static_cast<size_t>(build_workers) * n_nodes, 0);
+    std::vector<uint64_t> local_incoming(static_cast<size_t>(build_workers) * n_words, 0);
+    std::vector<std::thread> build_threads;
+    build_threads.reserve(build_workers);
+
+    for (uint32_t worker = 0; worker < build_workers; ++worker) {
+        build_threads.emplace_back([&, worker]() {
+            const char* p = chunk_starts[worker];
+            const char* chunk_end = chunk_starts[worker + 1];
+            uint32_t* degree_row = local_degrees.data() + static_cast<size_t>(worker) * n_nodes;
+            uint64_t* incoming_row = local_incoming.data() + static_cast<size_t>(worker) * n_words;
+            while (p < chunk_end) {
+                while (p < chunk_end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+                if (p >= chunk_end) break;
+                uint32_t u = static_cast<uint32_t>(parse_uint64(p, chunk_end));
+                uint32_t v = static_cast<uint32_t>(parse_uint64(p, chunk_end));
+                parse_uint64(p, chunk_end); // w
+                ++degree_row[u];
+                incoming_row[v >> 6] |= (uint64_t(1) << (v & 63));
+            }
+        });
+    }
+    for (auto& thread : build_threads) thread.join();
+    build_threads.clear();
+
+    std::vector<uint64_t> has_in(n_words, 0);
+    for (uint32_t worker = 0; worker < build_workers; ++worker) {
+        const uint64_t* incoming_row =
+            local_incoming.data() + static_cast<size_t>(worker) * n_words;
+        for (size_t word = 0; word < n_words; ++word) has_in[word] |= incoming_row[word];
+    }
+
+    // Prefix each worker's local degree into its disjoint per-vertex CSR cursor.
+    // Reusing local_degrees avoids a second worker-by-vertex scratch matrix.
+    std::vector<uint32_t> offsets(n_nodes + 1, 0);
+    uint32_t edge_prefix = 0;
+    for (uint32_t u = 0; u < n; ++u) {
+        offsets[u] = edge_prefix;
+        for (uint32_t worker = 0; worker < build_workers; ++worker) {
+            uint32_t& count_or_cursor =
+                local_degrees[static_cast<size_t>(worker) * n_nodes + u];
+            uint32_t degree = count_or_cursor;
+            count_or_cursor = edge_prefix;
+            edge_prefix += degree;
+        }
+    }
+    offsets[n] = edge_prefix;
+    if (edge_prefix != m) return 1;
+
+    std::vector<Edge> edges(m);
+    for (uint32_t worker = 0; worker < build_workers; ++worker) {
+        build_threads.emplace_back([&, worker]() {
+            const char* p = chunk_starts[worker];
+            const char* chunk_end = chunk_starts[worker + 1];
+            uint32_t* cursor_row = local_degrees.data() + static_cast<size_t>(worker) * n_nodes;
+            while (p < chunk_end) {
+                while (p < chunk_end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+                if (p >= chunk_end) break;
+                uint32_t u = static_cast<uint32_t>(parse_uint64(p, chunk_end));
+                uint32_t v = static_cast<uint32_t>(parse_uint64(p, chunk_end));
+                uint32_t w = static_cast<uint32_t>(parse_uint64(p, chunk_end));
+                uint32_t pos = cursor_row[u]++;
+                edges[pos] = {v, w};
+            }
+        });
+    }
+    for (auto& thread : build_threads) thread.join();
 
     munmap(const_cast<char*>(g_data), g_size);
     close(fd_g);
 
-    std::vector<uint32_t> offsets(n + 1, 0);
-    uint32_t cur = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        offsets[i] = cur;
-        cur += head[i];
-    }
-    offsets[n] = cur;
-
-    std::vector<Edge> edges(m);
-    std::vector<uint32_t> cur_pos = offsets;
-    for (uint32_t i = 0; i < m; ++i) {
-        uint32_t u = raw_edges[i].u;
-        uint32_t pos = cur_pos[u]++;
-        edges[pos] = {raw_edges[i].v, raw_edges[i].w};
-    }
-    std::vector<RawEdge>().swap(raw_edges);
-    std::vector<uint32_t>().swap(cur_pos);
-    std::vector<uint32_t>().swap(head);
+    std::vector<uint32_t>().swap(local_degrees);
+    std::vector<uint64_t>().swap(local_incoming);
 
     // 2. Read queries.txt
     int fd_q = open(queries_path.c_str(), O_RDONLY);
@@ -222,19 +253,18 @@ int main(int argc, char* argv[]) {
     close(fd_q);
 
     // 3. Parallel Dijkstra queries
-    // Use bounded number of threads (e.g. 6 P-cores or hardware concurrency capped at 8)
-    uint32_t num_threads = std::min<uint32_t>(8, std::thread::hardware_concurrency());
-    if (num_threads == 0) num_threads = 4;
+    // Eight workers gave the best measured time/RSS trade-off.
+    uint32_t num_threads = 8;
 
     std::vector<int64_t> answers(queries.size(), -1);
     std::atomic<size_t> query_idx{0};
 
     auto worker = [&]() {
-        // Per-thread distance and epoch state
+        // Per-thread distance and epoch state (compact 16-bit epoch saves 3.5 MB per thread)
         std::vector<uint64_t> dist(n, UINT64_MAX);
-        std::vector<uint32_t> visited_epoch(n, 0);
-        uint32_t current_epoch = 0;
-        QuadHeap qh;
+        std::vector<uint16_t> visited_epoch(n, 0);
+        uint16_t current_epoch = 0;
+        RadixHeap qh;
 
         while (true) {
             size_t idx = query_idx.fetch_add(1, std::memory_order_relaxed);
@@ -250,6 +280,12 @@ int main(int argc, char* argv[]) {
 
             // No incoming edge at t and s != t: t is unreachable from s.
             if (((has_in[t >> 6] >> (t & 63)) & 1) == 0) {
+                answers[idx] = -1;
+                continue;
+            }
+
+            // No outgoing edge from s and s != t: cannot reach anything from s.
+            if (offsets[s] == offsets[s + 1]) {
                 answers[idx] = -1;
                 continue;
             }
